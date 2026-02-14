@@ -159,19 +159,29 @@ the first is used and a warning is printed.
 
 #### Probe specification
 
-The probe is a dot-separated path from the top level down to the pin:
+Two forms are supported, and they can be mixed in a hierarchical path:
+
+**`inst.pinname`** — resolve by pin name. Requires the subcircuit definition
+to be present in the netlist or an included file. Works for all devices whose
+model is defined in the netlist.
+
+**`inst:N`** — resolve by 1-based pin position as written on the instance
+line. Does not require the subcircuit definition. Use this for library-only
+models (PDK devices, etc.) whose subcircuit is not in the netlist.
+
+Both forms support hierarchy — intermediate instances always use dot
+separation, only the leaf uses the colon:
 
 ```
-instance.pin
-instance1.instance2.pin
-instance1.instance2.instance3.pin
+instance.pin            dot form, top-level leaf
+instance:N              colon form, top-level leaf
+inst1.inst2.pin         dot form, inst2 inside inst1
+inst1.inst2:N           colon form, inst2 inside inst1
 ```
 
-The last element is always the pin name. All preceding elements are instance
-names. Instance names do not require the `X` prefix — it is added
-automatically.
+Instance names do not require the `X` prefix — it is added automatically.
 
-**Pin names by device type:**
+**Pin names for the dot form:**
 
 | Device | Prefix | Pin names |
 |--------|--------|-----------|
@@ -186,10 +196,11 @@ automatically.
 **Examples:**
 
 ```spice
-** ngr_stb rfb.1               * R1 pin 1 at top level
-** ngr_stb ota.out             * Xota subcircuit port 'out'
+** ngr_stb ota.out             * Xota subcircuit port 'out' (dot form)
+** ngr_stb xr1:1               * Xr1 pin 1 by position (library-only model)
 ** ngr_stb ldo.erramp.out      * Xerramp inside Xldo, port 'out'
 ** ngr_stb amp.m1.d            * MOSFET M1 drain inside Xamp
+** ngr_stb ldo.xrfb:1         * library resistor inside Xldo, pin 1
 ```
 
 #### How the Tian probe works
@@ -216,6 +227,8 @@ This gives an accurate result regardless of the loop's source/load impedances.
 
 Reference: M. Tian et al., *"Striving for Small-Signal Stability,"*
 IEEE Circuits & Devices, vol. 17, no. 1, pp. 31–41, Jan. 2001.
+
+**Phase unwrapping:** ngspice's `vp()` returns phase in (−180°, +180°]. The gain-margin calculation requires detecting the −180° crossing, which can fail when the phase wraps. ngrun applies `unwrap()` to the phase vector before all measurements to avoid this. Requires ngspice 37 or later.
 
 #### Stability output columns
 
@@ -244,6 +257,8 @@ Interpretation guide:
 
 If the loop never crosses 0 dB (UGF not found) or −180° (GM not found),
 the corresponding fields are `N/A`.
+
+**Raw waveform files** (`av`, `av_dB`, `av_ph`, unwrapped phase) are written to the same temporary directory as the generated corner netlists. Use `-k` to keep the temp directory and inspect the waveforms after the run.
 
 ---
 
@@ -410,6 +425,8 @@ this automatically by running them as two separate simulations.
 of the path component in the `.lib` statement:
 `.lib /path/to/models.lib key` — the tool matches on `models.lib` only,
 not the full path. The full path is preserved in substitution.
+
+**ngspice version requirement for stability analysis:** the `unwrap()` command used for phase unwrapping was introduced in ngspice 37. Earlier versions will fail when `ngr_stb` is active. Check your version with `ngspice --version`.
 
 **Timeout:** each ngspice subprocess has a 10-minute timeout. Adjust
 `timeout=600` in `run_ngspice()` if your simulations are longer.
