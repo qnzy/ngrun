@@ -436,20 +436,23 @@ def resolve_hierarchical_probe(netlist, path_parts):
         if not inst_name[0:1].lower() in ("x",) and inst_name[0].lower() not in PRIMITIVE_PIN_MAPS:
             inst_name = "x" + inst_name
 
-        # Find instance in current scope
+        # Find instance in current scope.
+        # The normalisation above may have added an 'x' prefix; if the name
+        # still isn't found, only retry with 'x' prefix if not already present.
         find = (netlist.find_top_instance if current_scope is None
                 else current_scope.find_instance)
         idx, inst_parts = find(inst_name)
-        if idx is None:
+        if idx is None and not inst_name.lower().startswith("x"):
             idx, inst_parts = find("x" + inst_name)
-            if idx is None:
-                scope_name = "top level" if current_scope is None else current_scope.name
-                raise ValueError(f"Instance '{inst_name}' not found in {scope_name}.")
-            inst_name = "x" + inst_name
-            if current_scope is None:
-                inst_parts = netlist.top_lines[idx].text.split()
-            else:
-                inst_parts = current_scope.body_lines[idx].text.split()
+            if idx is not None:
+                inst_name = "x" + inst_name
+                if current_scope is None:
+                    inst_parts = netlist.top_lines[idx].text.split()
+                else:
+                    inst_parts = current_scope.body_lines[idx].text.split()
+        if idx is None:
+            scope_name = "top level" if current_scope is None else current_scope.name
+            raise ValueError(f"Instance '{inst_name}' not found in {scope_name}.")
 
         if is_leaf:
             if pin_positional is not None:
