@@ -46,12 +46,16 @@ They must start with 'ngr_' to be recognised.
    Examples:
      ** ngr_stb ota.out
      ** ngr_stb reg.erramp.out fstart=0.1 fstop=1e9 pts=50
-     ** ngr_stb rfb.1
-   Probe specification (hierarchical dot notation):
-     inst.pin                - pin on a top-level instance
-     inst1.inst2.pin         - pin on inst2 inside inst1's subcircuit
+     ** ngr_stb xr1:1
+   Probe specification - two forms:
+     inst.pinname    - resolve by pin name (requires subckt definition in netlist)
+     inst:N          - resolve by 1-based pin position (always works)
+   Both support hierarchy:  inst1.inst2.pinname  or  inst1.inst2:N
    Pin names for primitives: 1/2 (R/C/L/V/I), d/g/s/b (M), a/k (D), c/b/e (Q)
+   Use inst:N for library-only models whose subckt definition is not present.
    Stability columns in CSV: a0_db, ugf_freq, pm, gm_freq, gm_db
+   Raw waveform written to the temp directory (alongside generated netlists).
+   Requires ngspice 37+ for phase unwrapping.
 
 SIMULATION MODES
 ----------------
@@ -351,6 +355,58 @@ def _clone_subckt(original, new_name):
     return SubcktDef(new_name, list(original.pins), body, list(original.params))
 
 
+def _parse_probe_spec(spec: str):
+    """
+    Parse a probe specification into path_parts suitable for
+    resolve_hierarchical_probe.
+
+    Two leaf forms are supported:
+      inst.pinname  ->  [..., inst, pinname]  pin_positional=None
+      inst:N        ->  [..., inst, None]      pin_positional=N-1 (0-based)
+
+    Hierarchy is always dot-separated up to the leaf instance.
+    The colon form is only valid on the LAST instance in the path.
+
+    Returns a list where:
+      parts[:-2]  = intermediate instance names
+      parts[-2]   = leaf instance name
+      parts[-1]   = pin name string  (dot form)
+                  = None              (colon form, index stored in parts[-2+offset])
+    Actually: returns a flat list and encodes positional as the sentinel.
+
+    Simpler: returns (path_parts, pin_positional) but we keep the existing
+    list-based API by appending a special sentinel at the end.
+    Internally resolve_hierarchical_probe reads path_parts[-2] as the
+    leaf instance and path_parts[-1] as pin_name; if the colon form was
+    used, path_parts[-1] is None and path_parts[-2] ends with the colon
+    index already stripped.
+
+    To keep the API clean: returns a plain list of strings where the last
+    element is either a pin name string or the string ':N' which the
+    caller detects.
+    """
+    # Check for colon form on the last segment
+    # e.g. 'xamp.xr1:2' -> segments ['xamp', 'xr1:2']
+    #       'xr1:1'      -> segments ['xr1:1']
+    segments = spec.split(".")
+    last = segments[-1]
+    colon_m = re.match(r'^(.+):([1-9][0-9]*)$', last)
+    if colon_m:
+        inst_part = colon_m.group(1)
+        n = int(colon_m.group(2))
+        if n < 1:
+            raise ValueError(f"Pin index in '{spec}' must be >= 1")
+        # Replace last segment with inst name, append sentinel ':N'
+        parts = segments[:-1] + [inst_part, f":{n}"]
+    else:
+        # dot form: last segment is pin name, preceding is leaf instance
+        if len(segments) < 2:
+            raise ValueError(
+                f"Probe must be 'inst.pin' or 'inst:N', got '{spec}'")
+        parts = segments
+    return parts
+
+
 def resolve_hierarchical_probe(netlist, path_parts):
     """
     Walk the hierarchy, clone subcircuits as needed, and return
@@ -360,8 +416,15 @@ def resolve_hierarchical_probe(netlist, path_parts):
     if len(path_parts) < 2:
         raise ValueError(f"Probe must be at least instance.pin, got: {'.'.join(path_parts)}")
 
-    instances = path_parts[:-1]
-    pin_name = path_parts[-1]
+    # Decode sentinel from _parse_probe_spec
+    if path_parts[-1].startswith(":"):
+        pin_positional = int(path_parts[-1][1:]) - 1  # convert to 0-based
+        pin_name = None
+        instances = path_parts[:-1]  # last element is leaf instance
+    else:
+        pin_positional = None
+        pin_name = path_parts[-1]
+        instances = path_parts[:-1]
     current_scope = None
     clone_suffix = "_stb"
 
@@ -389,11 +452,22 @@ def resolve_hierarchical_probe(netlist, path_parts):
                 inst_parts = current_scope.body_lines[idx].text.split()
 
         if is_leaf:
-            if is_subckt_instance(inst_name):
+            if pin_positional is not None:
+                # inst:N form - direct positional, no subckt lookup needed
+                _, nets = _resolve_instance_subckt(netlist, inst_parts)
+                pin_idx = pin_positional
+                if pin_idx >= len(nets):
+                    raise ValueError(
+                        f"Pin index {pin_positional+1} out of range for '{inst_name}' "
+                        f"({len(nets)} nets on instance line).")
+            elif is_subckt_instance(inst_name):
                 subckt_name, _ = _resolve_instance_subckt(netlist, inst_parts)
                 subckt_def = netlist.get_subckt(subckt_name)
                 if subckt_def is None:
-                    raise ValueError(f"Subcircuit '{subckt_name}' not found.")
+                    raise ValueError(
+                        f"Subcircuit '{subckt_name}' definition not found. "
+                        f"Use the inst:N form (e.g. {inst_name}:1) to specify "
+                        f"the pin by position when the subckt is library-only.")
                 pin_idx = _resolve_pin_index(inst_name, pin_name, subckt_def.pins)
             else:
                 pin_idx = _resolve_pin_index(inst_name, pin_name)
@@ -494,8 +568,10 @@ def _build_tian_control(stb_x, raw_file, fstart, fstop, pts,
         "let av = D / (1 - D)",
         "let av_dB = vdb(av)",
         "let av_ph_rad = vp(av)",
-        "let av_ph = 180/pi * vp(av)",
+        "let av_ph_rad_uw = unwrap(av_ph_rad)",
+        "let av_ph = 180/pi * av_ph_rad",
         "",
+        "* PM: use wrapped phase - correctly handles non-monotone phase",
         f"meas ac a0_db    find av_dB    at = {fstart:.6e}",
         "meas ac ugf_freq  when av_dB    = 0",
         "meas ac ugf_ph_rad find av_ph_rad when av_dB = 0 cross=1",
@@ -503,13 +579,14 @@ def _build_tian_control(stb_x, raw_file, fstart, fstop, pts,
         "let pm = 180 + ugf_ph_deg",
         "print pm",
         "",
+        "* GM: use unwrapped phase to avoid false -180 crossings from wrapping",
         "let n180_rad = -pi",
-        "meas ac gm_freq  when av_ph_rad = n180_rad cross=1",
-        "meas ac gm_gain  find av_dB     when av_ph_rad = n180_rad cross=1",
+        "meas ac gm_freq  when av_ph_rad_uw = n180_rad cross=1",
+        "meas ac gm_gain  find av_dB        when av_ph_rad_uw = n180_rad cross=1",
         "let gm_db = -gm_gain",
         "print gm_db",
         "",
-        f"write {raw_file} av av_dB av_ph frequency",
+        f"write {raw_file} av av_dB av_ph av_ph_rad_uw frequency",
         "",
         "quit",
         ".endc",
@@ -525,9 +602,7 @@ def instrument_netlist_tian(netlist_text, probe_spec, fstart, fstop, pts,
     """
     lines = netlist_text.splitlines(keepends=True)
     netlist = SpiceNetlist.parse(lines, base_dir)
-    path_parts = probe_spec.split(".")
-    if len(path_parts) < 2:
-        raise ValueError(f"Probe must be 'instance.pin', got '{probe_spec}'")
+    path_parts = _parse_probe_spec(probe_spec)
 
     original_net, new_net, stb_x, scope = resolve_hierarchical_probe(netlist, path_parts)
 
@@ -738,9 +813,13 @@ class CornerGenerator:
 STB_MEASURES = ["a0_db", "ugf_freq", "pm", "gm_freq", "gm_db"]
 
 
-def _run_ngspice(path: str, timeout: int = 300) -> Tuple[str, str, int]:
-    r = subprocess.run(["ngspice", "-b", path],
-                       capture_output=True, text=True, timeout=timeout)
+def _run_ngspice(path: str, timeout: int = 300,
+                 rawfile: Optional[str] = None) -> Tuple[str, str, int]:
+    cmd = ["ngspice", "-b"]
+    if rawfile:
+        cmd.append(f"--rawfile={rawfile}")
+    cmd.append(path)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return r.stdout, r.stderr, r.returncode
 
 
@@ -758,10 +837,21 @@ def _extract_tian_measures(stdout: str, stderr: str) -> Dict[str, str]:
     """
     Extract Tian results.
     a0_db / ugf_freq / gm_freq come from .meas; pm / gm_db from print.
-    All share the same regex pattern.
+    PM is normalised to (-180, 180] to correct for unwrap-induced offsets.
     """
     combined = stdout + "\n" + stderr
-    return _extract_measures(combined, STB_MEASURES)
+    results = _extract_measures(combined, STB_MEASURES)
+    # Normalise PM to (-180, 180]: ((pm + 180) % 360) - 180
+    # Handles cases where wrapped phase at UGF lands outside the expected
+    # range, e.g. 389 deg -> 29 deg, while preserving negative PM correctly.
+    pm_raw = results.get("pm", "N/A")
+    if pm_raw not in ("N/A", "SIM_ERROR", "TIMEOUT", "ERROR"):
+        try:
+            pm_norm = ((float(pm_raw) + 180.0) % 360.0) - 180.0
+            results["pm"] = str(pm_norm)
+        except ValueError:
+            pass
+    return results
 
 
 def print_tian_summary(measures: Dict[str, str], corner_id: str = ""):
@@ -825,7 +915,7 @@ def _run_corner_worker(args_tuple) -> Dict:
     args_tuple: (corner, normal_path, tian_path, out_measures, has_out, has_stb)
     normal_path / tian_path may be None.
     """
-    corner, normal_path, tian_path, out_measures, has_out, has_stb = args_tuple
+    corner, normal_path, tian_path, normal_rawfile, out_measures, has_out, has_stb = args_tuple
 
     row = {
         "corner_id":   corner["id"],
@@ -837,7 +927,7 @@ def _run_corner_worker(args_tuple) -> Dict:
 
     if has_out and normal_path:
         try:
-            stdout, stderr, rc = _run_ngspice(normal_path)
+            stdout, stderr, rc = _run_ngspice(normal_path, rawfile=normal_rawfile)
             if rc != 0:
                 row.update({m: "SIM_ERROR" for m in out_measures})
             else:
@@ -900,7 +990,7 @@ def run_typ(netlist_path: str, config: NgConfig, output_file: str):
     # Tian simulation
     if config.has_stb:
         stb = config.stb
-        raw_file = os.path.join(base_dir, f"{base_name}_typ_tian.raw")
+        raw_file = os.path.join(tempfile.gettempdir(), f"ngrun_{base_name}_typ_tian.raw")
         try:
             tian_text = instrument_netlist_tian(
                 netlist_text, stb["probe"],
@@ -970,7 +1060,7 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
             generator.write_corner_netlist(corner, normal_path)
 
         if config.has_stb:
-            raw_file  = os.path.join(base_dir, f"{base_name}_{cid}_tian.raw")
+            raw_file  = os.path.join(temp_dir, f"{cid}_tian.raw")
             tian_path = os.path.join(temp_dir, f"{cid}_tian.sp")
             try:
                 generator.write_tian_netlist(corner, tian_path, raw_file, base_dir)
@@ -978,7 +1068,11 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
                 print(f"  Warning: Tian probe error for {cid}: {e}")
                 tian_path = None
 
-        sim_args.append((corner, normal_path, tian_path,
+        normal_rawfile = (
+            os.path.splitext(normal_path)[0] + ".raw"
+            if normal_path else None
+        )
+        sim_args.append((corner, normal_path, tian_path, normal_rawfile,
                          config.outputs, config.has_out, config.has_stb))
 
     print(f"  {n} netlist(s) created")
@@ -1020,17 +1114,149 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
     _write_csv(output_file, results, config)
     print(f"  {len(results)} row(s) written")
 
+    _print_summary(results, config)
+
     if not keep_netlists:
         import shutil; shutil.rmtree(temp_dir)
+        if config.has_stb:
+            print("  Stability raw files removed (use -k to preserve)")
     else:
-        print(f"  Netlists preserved in: {temp_dir}")
+        print(f"  Temp directory preserved: {temp_dir}")
+        if config.has_stb:
+            print(f"  Stability raw files in:   {temp_dir}")
 
-    # Print stability summaries to terminal
+
+# ---------------------------------------------------------------------------
+# Results summary
+# ---------------------------------------------------------------------------
+
+# Columns that get special unit formatting in the summary
+_STB_UNITS = {
+    "a0_db":    "dB",
+    "ugf_freq": "freq",
+    "pm":       "deg",
+    "gm_freq":  "freq",
+    "gm_db":    "dB",
+}
+
+
+def _fmt_summary_val(val_str: str, col: str) -> str:
+    """Format a numeric value with appropriate units for summary display."""
+    try:
+        v = float(val_str)
+    except (ValueError, TypeError):
+        return val_str
+
+    unit = _STB_UNITS.get(col)
+    if unit == "freq":
+        if abs(v) >= 1e9:
+            return f"{v/1e9:.3f} GHz"
+        elif abs(v) >= 1e6:
+            return f"{v/1e6:.3f} MHz"
+        elif abs(v) >= 1e3:
+            return f"{v/1e3:.3f} kHz"
+        return f"{v:.3f} Hz"
+    elif unit == "dB":
+        return f"{v:.2f} dB"
+    elif unit == "deg":
+        return f"{v:.2f} deg"
+    else:
+        # Generic: use engineering-ish notation
+        if v == 0:
+            return "0"
+        elif abs(v) >= 1e6 or (abs(v) < 1e-3 and v != 0):
+            return f"{v:.4e}"
+        else:
+            return f"{v:.4g}"
+
+
+def _print_summary(results: List[Dict], config: NgConfig):
+    """Print a min/max summary table for all numeric result columns."""
+    if not results:
+        return
+
+    # Determine which columns to summarise: ng_out measures + stb fields
+    measure_cols = list(config.outputs)
     if config.has_stb:
-        print()
+        for m in STB_MEASURES:
+            if m not in measure_cols:
+                measure_cols.append(m)
+    if not measure_cols:
+        return
+
+    # For each column collect (float_value, corner_id) pairs, skip non-numeric
+    ERROR_TOKENS = {"N/A", "SIM_ERROR", "TIMEOUT", "ERROR", "PROBE_ERROR"}
+    col_stats: Dict[str, Dict] = {}
+    failed_corners = set()
+
+    for r in results:
+        cid = r.get("corner_id", "?")
+        # Track corners with any error
+        for col in measure_cols:
+            v = r.get(col, "N/A")
+            if v in ERROR_TOKENS:
+                failed_corners.add(cid)
+
+    for col in measure_cols:
+        vals = []
         for r in results:
-            print_tian_summary({m: r.get(m, "N/A") for m in STB_MEASURES},
-                                corner_id=r["corner_id"])
+            raw = r.get(col, "N/A")
+            if raw not in ERROR_TOKENS:
+                try:
+                    vals.append((float(raw), r.get("corner_id", "?")))
+                except (ValueError, TypeError):
+                    pass
+        if vals:
+            min_val, min_cid = min(vals, key=lambda x: x[0])
+            max_val, max_cid = max(vals, key=lambda x: x[0])
+            col_stats[col] = {
+                "min_val": min_val, "min_cid": min_cid,
+                "max_val": max_val, "max_cid": max_cid,
+                "n": len(vals),
+            }
+
+    if not col_stats:
+        return
+
+    # Layout
+    W = 60
+    col_w   = max(len(c) for c in col_stats) + 2
+    val_w   = 16
+    cid_w   = max(len(s["min_cid"]) for s in col_stats.values())
+    cid_w   = max(cid_w, len("Corner")) + 2
+
+    header = (f"  {'Measure':<{col_w}}  "
+              f"{'Min':<{val_w}}  {'Corner':<{cid_w}}  "
+              f"{'Max':<{val_w}}  {'Corner':<{cid_w}}")
+    sep    = "  " + "─" * (len(header) - 2)
+    border = "═" * len(header)
+
+    print()
+    print(border)
+    print(f"  Results Summary  ({len(results)} corners, "
+          f"{len(results) - len(failed_corners)} successful)")
+    print(border)
+    print(header)
+    print(sep)
+
+    for col in measure_cols:
+        if col not in col_stats:
+            print(f"  {col:<{col_w}}  {'(no valid data)'}")
+            continue
+        s = col_stats[col]
+        min_s = _fmt_summary_val(str(s["min_val"]), col)
+        max_s = _fmt_summary_val(str(s["max_val"]), col)
+        print(f"  {col:<{col_w}}  "
+              f"{min_s:<{val_w}}  {s['min_cid']:<{cid_w}}  "
+              f"{max_s:<{val_w}}  {s['max_cid']:<{cid_w}}")
+
+    print(border)
+    if failed_corners:
+        n_fail = len(failed_corners)
+        print(f"  {n_fail} corner(s) had simulation errors: "
+              f"{', '.join(sorted(failed_corners))}")
+        print(border)
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -1126,7 +1352,7 @@ def main():
 
     print()
     print("╔═══════════════════════════════════════════════════════════════════════════╗")
-    print("║                             Complete!                                    ║")
+    print("║                             Complete!                                     ║")
     print("╚═══════════════════════════════════════════════════════════════════════════╝")
 
 
