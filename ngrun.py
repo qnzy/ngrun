@@ -26,7 +26,7 @@ They must start with 'ngr_' to be recognised.
    Syntax: ** ngr_lib <libfile>[(<key>)] <corner1> ... <cornerN>
    Examples:
      ** ngr_lib process.lib tt ff ss
-     ** ngr_lib models.lib(mos_typ) tt ff ss
+     ** ngr_lib models.lib(tt) tt ff ss
    Matches .lib statements by filename (and optional key), substitutes corner.
 
 3. ngr_temp - Temperature sweep

@@ -33,7 +33,7 @@ Add `ngr_` directives as comments in your netlist, then run:
 ```spice
 * My LDO regulator
 ** ngr_param vdd_p 3.0 3.3 3.6
-** ngr_lib models.lib(mos_typ) tt ff ss
+** ngr_lib models.lib(tt) tt ff ss
 ** ngr_temp -40 27 125
 ** ngr_out vout_dc iq_ua
 ** ngr_stb rfb.1
@@ -89,8 +89,8 @@ different keys.
 
 ```spice
 ** ngr_lib models.lib tt ff ss
-** ngr_lib models.lib(mos_typ) tt ff ss
-** ngr_lib models.lib(res_typ) res_nom res_fast res_slow
+** ngr_lib models.lib(tt) tt ff ss
+** ngr_lib models.lib(res_nom) res_nom res_fast res_slow
 ```
 
 The tool matches `.lib /any/path/models.lib <key>` and replaces `<key>`.
