@@ -38,7 +38,7 @@ Add `ngr_` directives as comments in your netlist, then run:
 ** ngr_out vout_dc iq_ua
 ** ngr_stb rfb.1
 
-.lib /path/to/models.lib mos_typ
+.lib /path/to/models.lib tt
 .param vdd_p=3.3
 ...
 ```
@@ -326,7 +326,7 @@ corner_id | temperature | param_<name>... | lib_<name>... | <ngr_out measures>..
 **Example rows:**
 
 ```csv
-corner_id,temperature,param_vdd_p,lib_models.lib_mos_typ,trise,tfall,a0_db,ugf_freq,pm,gm_freq,gm_db
+corner_id,temperature,param_vdd_p,lib_models.lib_tt,trise,tfall,a0_db,ugf_freq,pm,gm_freq,gm_db
 c0001,-40,2.7,tt,1.23e-9,2.45e-9,78.3,1.45e6,62.1,3.2e7,18.4
 c0002,-40,2.7,ff,1.18e-9,2.31e-9,79.1,1.52e6,59.8,3.4e7,19.1
 ...
@@ -362,12 +362,12 @@ python3 ngrun.py inv_chain.sp
 ```spice
 * LDO regulator
 ** ngr_param vdd_p 3.0 3.3 3.6
-** ngr_lib models.lib(mos_typ) tt ff ss
+** ngr_lib models.lib(tt) tt ff ss
 ** ngr_temp -40 27 125
 ** ngr_out vout_dc psrr_db iq_ua
 ** ngr_stb rfb.1 fstart=1 fstop=100e6 pts=50
 
-.lib /pdk/models.lib mos_typ
+.lib /pdk/models.lib tt
 .param vdd_p=3.3
 ...
 ```
