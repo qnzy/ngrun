@@ -185,21 +185,12 @@ class SpiceNetlist:
         self.title = ""
         self.top_lines = []
         self.subckt_defs = {}
-        self.include_paths = []
 
     @classmethod
     def parse(cls, lines, base_dir="."):
         nl = cls()
         merged = cls._merge_continuations(lines)
         nl._parse_structure(merged)
-        for inc_path in nl.include_paths:
-            full = inc_path if os.path.isabs(inc_path) else os.path.join(base_dir, inc_path)
-            if os.path.isfile(full):
-                try:
-                    with open(full) as f:
-                        nl._parse_included_subckts(cls._merge_continuations(f.readlines()))
-                except IOError:
-                    pass
         return nl
 
     @staticmethod
@@ -224,9 +215,6 @@ class SpiceNetlist:
             sl = merged[i]
             lower = sl.text.strip().lower()
             if lower.startswith(".include") or lower.startswith(".lib"):
-                parts = sl.text.strip().split(None, 1)
-                if len(parts) >= 2:
-                    self.include_paths.append(parts[1].strip().strip('"\''))
                 self.top_lines.append(sl)
                 i += 1
                 continue
@@ -268,16 +256,6 @@ class SpiceNetlist:
             body.append(merged[i])
             i += 1
         return SubcktDef(name, pins, body, params), i
-
-    def _parse_included_subckts(self, merged):
-        i = 0
-        while i < len(merged):
-            if merged[i].text.strip().lower().startswith(".subckt"):
-                subckt, end_i = self._parse_subckt_block(merged, i)
-                self.subckt_defs.setdefault(subckt.name.lower(), subckt)
-                i = end_i + 1
-            else:
-                i += 1
 
     def get_subckt(self, name):
         return self.subckt_defs.get(name.lower())
@@ -773,11 +751,11 @@ class CornerGenerator:
                 if m:
                     ml = f"{m.group(1)}{pval}{m.group(3)}\n"
             for (libfile, key), cval in corner["libs"].items():
-                pat = r'^(\s*\.lib\s+)(.*)/' + re.escape(libfile) + r'(\s+)(\S+)(.*)'
+                pat = r'^(\s*\.lib\s+)((?:.*/)?)' + re.escape(libfile) + r'(\s+)(\S+)(.*)'
                 m = re.match(pat, ml, re.IGNORECASE)
                 if m:
                     if key is None or m.group(4).strip() == key.strip():
-                        ml = f"{m.group(1)}{m.group(2)}/{libfile}{m.group(3)}{cval}{m.group(5)}\n"
+                        ml = f"{m.group(1)}{m.group(2)}{libfile}{m.group(3)}{cval}{m.group(5)}\n"
             if re.match(r'^\s*\.temp\s', ml, re.IGNORECASE):
                 ml = f".temp {corner['temperature']}\n"
                 temp_inserted = True
@@ -816,7 +794,7 @@ class CornerGenerator:
 STB_MEASURES = ["a0_db", "ugf_freq", "pm", "gm_freq", "gm_db"]
 
 
-def _run_ngspice(path: str, timeout: int = 300,
+def _run_ngspice(path: str, timeout: int = 600,
                  rawfile: Optional[str] = None) -> Tuple[str, str, int]:
     cmd = ["ngspice", "-b"]
     if rawfile:
@@ -1339,6 +1317,18 @@ def main():
 
     if not config.has_out and not config.has_stb:
         print("  Warning: no ngr_out or ngr_stb - nothing will be extracted from results")
+
+    # Validate ngr_param names against .param statements in the netlist
+    if config.params:
+        defined_params = set()
+        for line in lines:
+            m = re.match(r'^\s*\.param\s+(\w+)\s*=', line, re.IGNORECASE)
+            if m:
+                defined_params.add(m.group(1).lower())
+        for pname in config.params:
+            if pname.lower() not in defined_params:
+                print(f"  WARNING: ngr_param '{pname}' has no matching "
+                      f".param statement in the netlist")
 
     if config.has_out and config.has_stb:
         print("  Note: ngr_out + ngr_stb present - 2 simulations per corner")
