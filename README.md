@@ -6,6 +6,8 @@ Automates corner sweeps and/or Tian closed-loop stability analysis on ngspice
 netlists. Configuration is embedded as comment directives directly in the
 netlist — no separate config file needed.
 
+This is script is public domain / CC0.
+
 ---
 
 ## Installation
