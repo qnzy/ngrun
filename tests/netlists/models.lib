@@ -1,0 +1,14 @@
+* Test model library for ngrun corner sweeps.
+* Each section defines kfac, a multiplier applied to the RC time constant.
+
+.lib tt
+.param kfac=1.0
+.endl tt
+
+.lib ff
+.param kfac=0.8
+.endl ff
+
+.lib ss
+.param kfac=1.25
+.endl ss

@@ -655,6 +655,24 @@ class NgConfig:
         return bool(self.stb_list)
 
 
+# Token shapes accepted inside ngr_ directives.  A prose comment that happens
+# to begin with 'ngr_' will almost always fail one of these, which is what
+# stops it from being silently absorbed as configuration.
+_RE_NAME     = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_RE_CORNER   = re.compile(r'^[A-Za-z_][A-Za-z0-9_.\-]*$')
+_RE_NUMBER   = re.compile(r'^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?[A-Za-z]*$')
+_RE_VALUE    = re.compile(r'^(?:\{[^}]*\}|\'[^\']*\'|[-+]?(?:\d+\.?\d*|\.\d+)'
+                          r'(?:[eE][-+]?\d+)?[A-Za-z]*)$')
+_RE_LIBSPEC  = re.compile(r'^([^()\s]+?)(?:\(([^()\s]+)\))?$')
+_RE_PROBE    = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*(?::[1-9][0-9]*)?$')
+
+NGR_COMMANDS = ("ngr_param", "ngr_lib", "ngr_temp", "ngr_out", "ngr_stb")
+
+
+def _bad(line, why):
+    print(f"Warning: ignoring malformed directive ({why}): {line.strip()}")
+
+
 def parse_ng_directives(lines: List[str]) -> NgConfig:
     config = NgConfig()
     for line in lines:
@@ -665,37 +683,70 @@ def parse_ng_directives(lines: List[str]) -> NgConfig:
         if not content.startswith("ngr_"):
             continue
         parts = content.split()
-        if len(parts) < 2:
-            continue
         cmd, args = parts[0], parts[1:]
+
+        if cmd not in NGR_COMMANDS:
+            print(f"Warning: unknown directive '{cmd}' ignored: {s}")
+            print(f"         known directives: {', '.join(NGR_COMMANDS)}")
+            continue
+
+        if not args:
+            _bad(s, f"{cmd} needs arguments")
+            continue
 
         if cmd == "ngr_param":
             if len(args) < 2:
-                print(f"Warning: ngr_param requires name + value(s): {s}")
+                _bad(s, "ngr_param needs a name and at least one value")
+                continue
+            if not _RE_NAME.match(args[0]):
+                _bad(s, f"'{args[0]}' is not a valid parameter name")
+                continue
+            bad = [v for v in args[1:] if not _RE_VALUE.match(v)]
+            if bad:
+                _bad(s, f"not parameter values: {' '.join(bad)}")
                 continue
             config.params[args[0]] = args[1:]
 
         elif cmd == "ngr_lib":
             if len(args) < 2:
-                print(f"Warning: ngr_lib requires libfile + corner(s): {s}")
+                _bad(s, "ngr_lib needs a library and at least one corner")
                 continue
-            m = re.match(r'^([^()]+)(?:\(([^)]+)\))?$', args[0])
-            if m:
-                config.libs[(m.group(1), m.group(2))] = args[1:]
-            else:
-                print(f"Warning: invalid ngr_lib spec: {args[0]}")
+            m = _RE_LIBSPEC.match(args[0])
+            if not m:
+                _bad(s, f"'{args[0]}' is not a library spec")
+                continue
+            bad = [c for c in args[1:] if not _RE_CORNER.match(c)]
+            if bad:
+                _bad(s, f"not library corner names: {' '.join(bad)}")
+                continue
+            config.libs[(m.group(1), m.group(2))] = args[1:]
 
         elif cmd == "ngr_temp":
+            bad = [t for t in args if not _RE_NUMBER.match(t)]
+            if bad:
+                _bad(s, f"not temperatures: {' '.join(bad)}")
+                continue
+            if config.temps:
+                print(f"Warning: ngr_temp given more than once; "
+                      f"the later one wins: {s}")
             config.temps = args
 
         elif cmd == "ngr_out":
+            bad = [o for o in args if not _RE_NAME.match(o)]
+            if bad:
+                _bad(s, f"not measurement names: {' '.join(bad)}")
+                continue
+            if config.outputs:
+                print(f"Warning: ngr_out given more than once; "
+                      f"the later one wins: {s}")
             config.outputs = args
 
         elif cmd == "ngr_stb":
-            if not args:
-                print(f"Warning: ngr_stb requires a probe spec: {s}")
+            if not _RE_PROBE.match(args[0]):
+                _bad(s, f"'{args[0]}' is not a probe spec")
                 continue
             stb = {"probe": args[0], "fstart": 1.0, "fstop": 1e9, "pts": 100}
+            malformed = False
             for kv in args[1:]:
                 m = re.match(r'^(fstart|fstop|pts)=(\S+)$', kv, re.IGNORECASE)
                 if m:
@@ -703,9 +754,15 @@ def parse_ng_directives(lines: List[str]) -> NgConfig:
                     try:
                         stb[k] = int(m.group(2)) if k == "pts" else float(m.group(2))
                     except ValueError:
-                        print(f"Warning: invalid value for ngr_stb {k}: {m.group(2)}")
+                        _bad(s, f"invalid value for {k}: {m.group(2)}")
+                        malformed = True
+                        break
                 else:
-                    print(f"Warning: unknown ngr_stb option: {kv}")
+                    _bad(s, f"unknown ngr_stb option: {kv}")
+                    malformed = True
+                    break
+            if malformed:
+                continue
             config.stb_list.append(stb)
 
     return config
@@ -714,6 +771,70 @@ def parse_ng_directives(lines: List[str]) -> NgConfig:
 # ---------------------------------------------------------------------------
 # Corner generation and netlist creation
 # ---------------------------------------------------------------------------
+
+# A .param value is a braced expression, a quoted expression, or a bare token.
+_PARAM_VALUE = r"(?:\{[^}]*\}|'[^']*'|\"[^\"]*\"|\S+)"
+
+
+def _param_state(line: str, in_param: bool) -> bool:
+    """
+    Is this line part of a .param statement?
+
+    True for a '.param' line, and for a '+' continuation only when the
+    immediately preceding line was already part of the statement.  Anything
+    else -- including comments and blank lines -- terminates it.  A comment
+    between '.param' and its continuation is treated as a break rather than
+    guessed through; if that costs us a substitution, the ngr_param validator
+    turns it into a hard error rather than a silent miss.
+    """
+    if re.match(r'^\s*\.param\b', line, re.IGNORECASE):
+        return True
+    if in_param and line.lstrip().startswith("+"):
+        return True
+    return False
+
+
+def _subst_param_assignment(line: str, pname: str, pval: str):
+    """
+    Replace the value of assignment '<pname> = <value>' anywhere in a .param
+    line (or its '+' continuation).  Handles multi-assignment lines such as
+      .param vdd=3.3 cload=10p
+    Returns (new_line, n_substitutions).
+    """
+    pat = re.compile(r'(?<![\w.$])(' + re.escape(pname) + r')(\s*=\s*)' + _PARAM_VALUE,
+                     re.IGNORECASE)
+    return pat.subn(lambda m: f"{m.group(1)}{m.group(2)}{pval}", line)
+
+
+def collect_defined_params(lines: List[str]) -> set:
+    """
+    Names of all parameters assigned by .param statements, including
+    multi-assignment lines and '+' continuations.
+    """
+    defined = set()
+    in_param = False
+    for line in lines:
+        in_param = _param_state(line, in_param)
+        if not in_param:
+            continue
+        body = re.sub(r'^\s*(\.param\b|\+)', '', line, flags=re.IGNORECASE)
+        for m in re.finditer(r'(?<![\w.$])(\w+)\s*=', body):
+            defined.add(m.group(1).lower())
+    return defined
+
+
+def collect_lib_statements(lines: List[str]) -> List[Tuple[str, str]]:
+    """
+    (filename, key) for every '.lib <path> <key>' statement in the netlist.
+    The filename is the basename, matching how build_corner_text substitutes.
+    """
+    out = []
+    for line in lines:
+        m = re.match(r'^\s*\.lib\s+(\S+)\s+(\S+)', line, re.IGNORECASE)
+        if m:
+            out.append((os.path.basename(m.group(1)), m.group(2)))
+    return out
+
 
 class CornerGenerator:
     def __init__(self, lines: List[str], config: NgConfig, base_netlist: str):
@@ -726,7 +847,9 @@ class CornerGenerator:
         param_vals  = [self.config.params[n] for n in param_names]
         lib_keys    = sorted(self.config.libs)
         lib_vals    = [self.config.libs[k] for k in lib_keys]
-        temps       = self.config.temps or ["25"]
+        # No ngr_temp -> temperature is not substituted at all; the netlist's
+        # own .temp (or the simulator default) is left untouched.
+        temps       = self.config.temps or [None]
 
         corners = []
         cid = 0
@@ -744,25 +867,26 @@ class CornerGenerator:
 
     def build_corner_text(self, corner: Dict, raw_dir: str = None) -> str:
         modified = []
-        temp_inserted = False
+        set_temp = corner["temperature"] is not None
+        temp_inserted = not set_temp
+        in_param = False
         for line in self.lines:
+            in_param = _param_state(line, in_param)
             s = line.strip()
             if s.lstrip("*").strip().startswith("ngr_"):
                 modified.append(line)
                 continue
             ml = line
-            for pname, pval in corner["params"].items():
-                pat = r'^(\s*\.param\s+' + re.escape(pname) + r'\s*=\s*)(\S+)(.*)'
-                m = re.match(pat, ml, re.IGNORECASE)
-                if m:
-                    ml = f"{m.group(1)}{pval}{m.group(3)}\n"
+            if in_param:
+                for pname, pval in corner["params"].items():
+                    ml, _ = _subst_param_assignment(ml, pname, pval)
             for (libfile, key), cval in corner["libs"].items():
                 pat = r'^(\s*\.lib\s+)((?:.*/)?)' + re.escape(libfile) + r'(\s+)(\S+)(.*)'
                 m = re.match(pat, ml, re.IGNORECASE)
                 if m:
                     if key is None or m.group(4).strip() == key.strip():
                         ml = f"{m.group(1)}{m.group(2)}{libfile}{m.group(3)}{cval}{m.group(5)}\n"
-            if re.match(r'^\s*\.temp\s', ml, re.IGNORECASE):
+            if set_temp and re.match(r'^\s*\.temp\b', ml, re.IGNORECASE):
                 ml = f".temp {corner['temperature']}\n"
                 temp_inserted = True
             modified.append(ml)
@@ -770,7 +894,7 @@ class CornerGenerator:
             if raw_dir is not None and ml.strip().lower().startswith(".control"):
                 raw_path = os.path.join(raw_dir, f"{corner['id']}_norm.raw")
                 modified.append(f"set rawfile = {raw_path}\n")
-            if not temp_inserted and re.match(r'^\s*\.(tran|ac|dc|op)\s', ml, re.IGNORECASE):
+            if not temp_inserted and re.match(r'^\s*\.(tran|ac|dc|op)\b', ml, re.IGNORECASE):
                 modified[-1] = f".temp {corner['temperature']}\n"
                 modified.append(ml)
                 temp_inserted = True
@@ -829,8 +953,12 @@ def _extract_measures(output: str, names: List[str]) -> Dict[str, str]:
     for name in names:
         pat = re.compile(r'^\s*' + re.escape(name) + r'\s*=\s*(\S+)',
                          re.MULTILINE | re.IGNORECASE)
-        m = pat.search(output)
-        out[name] = m.group(1) if m else "N/A"
+        # Use the LAST match: ngspice echoes the netlist and parameter
+        # expansions before the results, so an earlier 'name = value' line
+        # (e.g. a .param of the same name) would otherwise shadow the
+        # actual .meas / print output.
+        matches = pat.findall(output)
+        out[name] = matches[-1] if matches else "N/A"
     return out
 
 
@@ -919,6 +1047,32 @@ def print_tian_summary(measures: Dict[str, str], corner_id: str = "",
 # Per-corner worker (normal + optional Tian)
 # ---------------------------------------------------------------------------
 
+def _base_row(corner: Dict) -> Dict:
+    """Identity columns for one corner (no measurement results)."""
+    return {
+        "corner_id":   corner["id"],
+        "temperature": (corner["temperature"]
+                        if corner["temperature"] is not None else "default"),
+        **{f"param_{k}": v for k, v in corner["params"].items()},
+        **{f"lib_{k[0]}{'_'+k[1] if k[1] else ''}": v
+           for k, v in corner["libs"].items()},
+    }
+
+
+def _error_row(args_tuple, tag: str = "WORKER_ERROR") -> Dict:
+    """
+    Placeholder row for a corner whose worker failed outright, so that the
+    CSV always has exactly one row per corner instead of silently dropping it.
+    """
+    corner, _normal_path, tian_jobs, out_measures, has_out, _has_stb = args_tuple
+    row = _base_row(corner)
+    if has_out:
+        row.update({m: tag for m in out_measures})
+    for _tian_path, col_suffix in tian_jobs:
+        row.update({m + col_suffix: tag for m in STB_MEASURES})
+    return row
+
+
 def _run_corner_worker(args_tuple) -> Dict:
     """
     Run one corner.  Designed to be called in-process or via ProcessPoolExecutor.
@@ -929,13 +1083,7 @@ def _run_corner_worker(args_tuple) -> Dict:
     """
     corner, normal_path, tian_jobs, out_measures, has_out, has_stb = args_tuple
 
-    row = {
-        "corner_id":   corner["id"],
-        "temperature": corner["temperature"],
-        **{f"param_{k}": v for k, v in corner["params"].items()},
-        **{f"lib_{k[0]}{'_'+k[1] if k[1] else ''}": v
-           for k, v in corner["libs"].items()},
-    }
+    row = _base_row(corner)
 
     if has_out and normal_path:
         try:
@@ -1121,16 +1269,22 @@ def run_corners(netlist_path: str, config: NgConfig, output_file: str,
             futures = {ex.submit(_run_corner_worker, a): a for a in sim_args}
             done = 0
             for fut in as_completed(futures):
+                arg = futures[fut]
                 try:
                     results.append(fut.result())
                 except Exception as e:
-                    print(f"  Corner failed: {e}")
+                    print(f"  Corner {arg[0]['id']} failed: {e}")
+                    results.append(_error_row(arg))
                 done += 1
                 if done % max(1, n // 10) == 0 or done == n:
                     print(f"  {done}/{n} ({100*done//n}%)")
     else:
         for i, arg in enumerate(sim_args):
-            results.append(_run_corner_worker(arg))
+            try:
+                results.append(_run_corner_worker(arg))
+            except Exception as e:
+                print(f"  Corner {arg[0]['id']} failed: {e}")
+                results.append(_error_row(arg))
             done = i + 1
             if done % max(1, n // 10) == 0 or done == n:
                 print(f"  {done}/{n} ({100*done//n}%)")
@@ -1338,6 +1492,8 @@ def main():
                         help="Output CSV file (default: <netlist>_results.csv)")
     parser.add_argument("-n", "--no-run", action="store_true",
                         help="Generate netlists only, do not simulate (corner mode)")
+    parser.add_argument("--force", action="store_true",
+                        help="Continue even if an ngr_param has no matching .param")
     args = parser.parse_args()
 
     if not os.path.isfile(args.netlist):
@@ -1359,8 +1515,13 @@ def main():
 
     print(f"  ngr_param:  {len(config.params)} parameter(s): "
           f"{list(config.params.keys()) or 'none'}")
-    print(f"  ngr_lib:    {len(config.libs)} library/libraries")
-    print(f"  ngr_temp:   {config.temps or ['25 (default)']}")
+    if config.libs:
+        for (libfile, key), corners in config.libs.items():
+            spec = libfile + (f"({key})" if key else "")
+            print(f"  ngr_lib:    {spec} -> {' '.join(corners)}")
+    else:
+        print(f"  ngr_lib:    (none)")
+    print(f"  ngr_temp:   {config.temps or ['unchanged (netlist/simulator default)']}")
     print(f"  ngr_out:    {config.outputs or ['(none)']}")
     if config.has_stb:
         for si, stb in enumerate(config.stb_list):
@@ -1374,16 +1535,35 @@ def main():
         print("  Warning: no ngr_out or ngr_stb - nothing will be extracted from results")
 
     # Validate ngr_param names against .param statements in the netlist
-    if config.params:
-        defined_params = set()
-        for line in lines:
-            m = re.match(r'^\s*\.param\s+(\w+)\s*=', line, re.IGNORECASE)
-            if m:
-                defined_params.add(m.group(1).lower())
+    # Validate ngr_param / ngr_lib against the netlist.  A sweep that matches
+    # nothing produces identical netlists across corners while the CSV reports
+    # different values, so this is an error rather than a warning.
+    problems = []
+    if config.params and not args.typ:
+        defined_params = collect_defined_params(lines)
         for pname in config.params:
             if pname.lower() not in defined_params:
-                print(f"  WARNING: ngr_param '{pname}' has no matching "
-                      f".param statement in the netlist")
+                problems.append(f"ngr_param '{pname}' is not assigned by any "
+                                f".param statement")
+    if config.libs and not args.typ:
+        statements = collect_lib_statements(lines)
+        for (libfile, key) in config.libs:
+            hits = [st for st in statements
+                    if st[0].lower() == os.path.basename(libfile).lower()
+                    and (key is None or st[1].lower() == key.lower())]
+            if not hits:
+                spec = libfile + (f"({key})" if key else "")
+                problems.append(f"ngr_lib '{spec}' matches no .lib statement")
+    if problems:
+        for p in problems:
+            print(f"  ERROR: {p}.", file=sys.stderr)
+        print(f"  Sweeping it would produce identical netlists across "
+              f"corners while the CSV reported different values.",
+              file=sys.stderr)
+        print(f"  Fix the directive, or pass --force to run anyway.",
+              file=sys.stderr)
+        if not args.force:
+            sys.exit(2)
 
     if config.has_out and config.has_stb:
         sims_per = 1 + len(config.stb_list)
