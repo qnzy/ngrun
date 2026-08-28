@@ -60,6 +60,10 @@ Tian stability simulation at each corner, and writes `ldo_results.csv`.
 All directives are embedded as SPICE comments (lines starting with `*`).
 They are ignored by ngspice and processed only by ngrun.
 
+Any comment line whose first word starts with `ngr_` is treated as a
+directive, so don't begin a prose comment that way. Unknown or malformed
+directives are reported and ignored rather than half-applied.
+
 ### `ngr_param` — parameter sweep
 
 ```spice
@@ -353,6 +357,7 @@ python3 ngrun.py [options] <netlist>
 | `-j N`, `--parallel N` | Run N corners in parallel (default: 1) |
 | `-o FILE`, `--output FILE` | Output CSV filename (default: `<netlist>_results.csv`) |
 | `-n`, `--no-run` | Generate netlists only, do not simulate (combine with `-k`) |
+| `--force` | Run even if a swept `.param`/`.lib` matches nothing in the netlist |
 
 ---
 
@@ -367,7 +372,7 @@ corner_id | temperature | param_<name>... | lib_<name>... | <ngr_out values>... 
 ```
 
 - `corner_id`: `c0001`, `c0002`, ... for corner sweeps; `typ` for `--typ` mode
-- `temperature`: in °C; `typ` if no temperature substitution was performed
+- `temperature`: in °C; `typ` in `--typ` mode, `default` if no `ngr_temp` was given
 - `param_*`: one column per swept parameter
 - `lib_*`: one column per swept library (name includes the key if specified)
 - Stability columns are only present if `ngr_stb` is defined
@@ -476,10 +481,12 @@ python3 ngrun.py ldo.sp -k -n
 
 ## Notes and limitations
 
-**Parameter validation:** `ngr_param` names are checked against `.param`
-statements in the netlist at startup. A warning is printed if a swept
-parameter name has no matching `.param` — this catches typos before running
-a potentially long corner sweep.
+**Sweep validation:** at startup `ngr_param` names are checked against the
+netlist's `.param` statements and `ngr_lib` files against its `.lib` statements.
+A sweep matching nothing would generate identical netlists while the CSV
+reported different values, so this is an error (exit 2), not a warning.
+Use `--force` to run anyway; `--typ` skips the check since it substitutes
+nothing.
 
 **Hierarchical probing** creates a clone of each subcircuit along the probe
 path (named with a `_stb` suffix). This ensures that only the targeted
@@ -521,3 +528,12 @@ in the `.lib` statement. Both full paths and bare filenames are supported:
   sourceforge.net/p/ngspice/feature-requests/34/
 - SLICE Semiconductor open source tool examples:
   github.com/SLICESemiconductor/OpenSourceTool_Examples
+
+---
+
+## Tests
+
+`tests/` holds a self-checking suite: `make test` from that directory. The
+netlist-generation checks need only Python; the simulation checks run ngspice
+and compare against closed-form answers, and are skipped if ngspice is absent.
+See `tests/TESTING.md`.
